@@ -23,7 +23,7 @@ def load_and_split_pdf(file_path):
     # 파일 없으면 깃허브에서 다운로드
     if not os.path.exists(file_path):
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        pdf_url = "https://raw.githubusercontent.com/IrisKim/rag_test/main/data/대한민국헌법(헌법)(제00010호)(19880225).pdf"
+        pdf_url = "https://github.com/kimdodoongtak/Langchain_Streamlit_chatbot/blob/master/data/대한민국헌법(헌법)(제00010호)(19880225).pdf"
         response = requests.get(pdf_url)
         with open(file_path, "wb") as f:
             f.write(response.content)
