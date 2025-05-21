@@ -1,78 +1,80 @@
 import os
 import streamlit as st
-import requests  # ⬅️ 추가
 
-from langchain_community.document_loaders import PyPDFLoader
+from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
+from langchain.vectorstores import FAISS
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories.streamlit import StreamlitChatMessageHistory
+
 from dotenv import load_dotenv
+load_dotenv() # .env 파일에서 환경변수 로드
 
-# 오픈AI API 키 설정
-load_dotenv("/Users/Iris/RAG/.env")
-api_key = os.getenv('OPENAI_API_KEY')
-
-# PDF 자동 다운로드 기능 포함
+#cache_resource로 한번 실행한 결과 캐싱해두기
 @st.cache_resource
-def load_and_split_pdf(file_path):
-    # 파일 없으면 깃허브에서 다운로드
-    if not os.path.exists(file_path):
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        pdf_url = "https://github.com/kimdodoongtak/Langchain_Streamlit_chatbot/blob/master/data/대한민국헌법(헌법)(제00010호)(19880225).pdf"
-        response = requests.get(pdf_url)
-        with open(file_path, "wb") as f:
-            f.write(response.content)
-
+def load_pdf(file_path):
     loader = PyPDFLoader(file_path)
-    return loader.load_and_split()
+    return loader.load()
 
+#텍스트 청크들을 FAISS 안에 임베딩 벡터로 저장
 @st.cache_resource
 def create_vector_store(_docs):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=50)
     split_docs = text_splitter.split_documents(_docs)
-    persist_directory = "./FAISS_db"
-    vectorstore = FAISS.from_documents(
-        split_docs, 
-        OpenAIEmbeddings(model='text-embedding-3-small')
-    )
-    vectorstore.save_local(persist_directory)
+    embeddings = OpenAIEmbeddings(model='text-embedding-3-small')
+    vectorstore = FAISS.from_documents(split_docs, embeddings)
+    
+    # 저장
+    # FAISS 자체 저장 방식 사용
+    vectorstore.save_local("faiss_index")
     return vectorstore
 
+#만약 기존에 저장해둔 FAISSDB가 있는 경우, 이를 로드
 @st.cache_resource
 def get_vectorstore(_docs):
-    persist_directory = "./FAISS_db"
+    persist_directory = "faiss_index/index.faiss"
     if os.path.exists(persist_directory):
-        return FAISS.load_local(
-            folder_path=persist_directory,
-            embeddings=OpenAIEmbeddings(model='text-embedding-3-small'),
-            allow_dangerous_deserialization=True
-        )
+        embeddings = OpenAIEmbeddings(model='text-embedding-3-small')
+        return FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
     else:
         return create_vector_store(_docs)
-
+    
+# PDF 문서 로드-벡터 DB 저장-검색기-히스토리 모두 합친 Chain 구축
 @st.cache_resource
 def initialize_components(selected_model):
-    file_path = "./data/대한민국헌법(헌법)(제00010호)(19880225).pdf"
-    pages = load_and_split_pdf(file_path)
+    file_path = r"./data/대한민국헌법(헌법)(제00010호)(19880225).pdf"
+    pages = load_pdf(file_path)
     vectorstore = get_vectorstore(pages)
     retriever = vectorstore.as_retriever()
 
+    # 채팅 히스토리 요약 시스템 프롬프트
+    contextualize_q_system_prompt = """Given a chat history and the latest user question \
+    which might reference context in the chat history, formulate a standalone question \
+    which can be understood without the chat history. Do NOT answer the question, \
+    just reformulate it if needed and otherwise return it as is."""
     contextualize_q_prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", """Given a chat history and the latest user question which might reference context in the chat history, formulate a standalone question which can be understood without the chat history. Do NOT answer the question, just reformulate it if needed and otherwise return it as is."""),
+            ("system", contextualize_q_system_prompt),
             MessagesPlaceholder("history"),
             ("human", "{input}"),
         ]
     )
 
+    # 질문-답변 시스템 프롬프트
+    qa_system_prompt = """You are an assistant for question-answering tasks. \
+    Use the following pieces of retrieved context to answer the question. \
+    If you don't know the answer, just say that you don't know. \
+    Keep the answer perfect. please use imogi with the answer.
+    대답은 한국어로 하고, 존댓말을 써줘.\
+
+    {context}"""
     qa_prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Keep the answer perfect. please use imogi with the answer. 대답은 한국어로 하고, 존댓말을 써줘.\n\n{context}"""),
+            ("system", qa_system_prompt),
             MessagesPlaceholder("history"),
             ("human", "{input}"),
         ]
@@ -84,7 +86,7 @@ def initialize_components(selected_model):
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
     return rag_chain
 
-# UI
+# Streamlit UI
 st.header("헌법 Q&A 챗봇 💬 📚")
 option = st.selectbox("Select GPT Model", ("gpt-4o-mini", "gpt-3.5-turbo-0125"))
 rag_chain = initialize_components(option)
@@ -98,11 +100,14 @@ conversational_rag_chain = RunnableWithMessageHistory(
     output_messages_key="answer",
 )
 
+
 if "messages" not in st.session_state:
-    st.session_state["messages"] = [{"role": "assistant", "content": "헌법에 대해 무엇이든 물어보세요!"}]
+    st.session_state["messages"] = [{"role": "assistant", 
+                                     "content": "헌법에 대해 무엇이든 물어보세요!"}]
 
 for msg in chat_history.messages:
     st.chat_message(msg.type).write(msg.content)
+
 
 if prompt_message := st.chat_input("Your question"):
     st.chat_message("human").write(prompt_message)
@@ -118,4 +123,3 @@ if prompt_message := st.chat_input("Your question"):
             with st.expander("참고 문서 확인"):
                 for doc in response['context']:
                     st.markdown(doc.metadata['source'], help=doc.page_content)
-
